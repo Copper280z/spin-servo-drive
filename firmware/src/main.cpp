@@ -7,9 +7,39 @@
 #include <encoders/ma730/MagneticSensorMA730.h>
 #include <encoders/hysteresis/HysteresisSensor.h>
 #include <comms/telemetry/SimpleTelemetry.h>
+#include <comms/streams/BinaryIO.h>
 #include <comms/telemetry/TeleplotTelemetry.h>
 #include <utilities/stm32math/STM32G4CORDICTrigFunctions.h>
 
+#include "SST/sst.hpp"
+#include "tasks/tasks.hpp"
+#include "SST/dbc_assert.h"
+
+
+
+
+namespace SST {
+  void onStart() {
+    SystemCoreClockUpdate();
+    SysTick_Config((SystemCoreClock/15000U)+1U);
+    NVIC_SetPriority(SysTick_IRQn, 0U);
+    // NVIC_EnableIRQ(SysTick_IRQn);
+  }
+
+  // void onIdle();
+}
+#ifdef __cplusplus
+extern "C" {
+#endif
+void osSystickHandler(){
+  SST::TimeEvt::tick();
+}
+void COMP4_IRQHandler();
+void COMP1_2_3_IRQHandler();
+
+#ifdef __cplusplus
+}
+#endif
 
 #define SERIAL_SPEED 115200
 
@@ -25,11 +55,12 @@
 
 
 // BLDC motor & driver instance
-BLDCMotor motor = BLDCMotor(4, 2.0f, 300.0f);
+BLDCMotor motor = BLDCMotor(5, 2.0f, 300.0f);
 BLDCDriver3PWM driver = BLDCDriver3PWM(PA0, PA1, PA2);
 
 //Position Sensor
-MagneticSensorMA730 sensor = MagneticSensorMA730(PB12);
+SPISettings sensorSPISettings(24000000, MA730_BITORDER, SPI_MODE3);
+MagneticSensorMA730 sensor = MagneticSensorMA730(PB12, sensorSPISettings);
 HysteresisSensor hysteresisSensor = HysteresisSensor(sensor, 0.001f);
 
 LowsideCurrentSense current_sense = LowsideCurrentSense(0.003, 46, PB0, PB1, PA3);
@@ -56,12 +87,39 @@ void doSetSensor(char* cmd) {
 };
 
 // telemetry
-TextIO textIO = TextIO(Serial);
-//SimpleTelemetry telemetry = SimpleTelemetry();
-TeleplotTelemetry telemetry = TeleplotTelemetry();
+TextIO IO = TextIO(Serial);
+// BinaryIO IO = BinaryIO(Serial);
+// SimpleTelemetry telemetry = SimpleTelemetry();
+// TeleplotTelemetry telemetry = TeleplotTelemetry();
+Telemetry telemetry = Telemetry();
 void doDownsample(char* cmd) { telemetry.downsample = atoi(cmd); };
 
+Tasks::Commutate commutate_task = Tasks::Commutate(motor, (SST::TCtr) 1U, (SST::TCtr) 1U);
+static SST::Evt const *commutateQSto[10];
+
+Tasks::Move move_task = Tasks::Move(motor, (SST::TCtr) 15U, (SST::TCtr) 15U);
+static SST::Evt const *moveQSto[10];
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void COMP4_IRQHandler() {
+  commutate_task.activate();
+}
+void COMP1_2_3_IRQHandler() {
+  move_task.activate();
+}
+#ifdef __cplusplus
+}
+#endif
+
 void setup() {
+  pinMode(PA8, OUTPUT);
+  pinMode(PC4, OUTPUT);
+  
+  digitalWrite(PA8, LOW);
+  digitalWrite(PC4, LOW);
+
   Serial.begin(SERIAL_SPEED);
   while (!Serial);
   SimpleFOCDebug::enable(&Serial);
@@ -125,7 +183,7 @@ void setup() {
 
   motor.torque_controller = TorqueControlType::foc_current;
   motor.controller = MotionControlType::angle;
-  motor.motion_downsample = 10;
+  motor.motion_downsample = 0;
 
   // load settings
   settings.addMotor(&motor);
@@ -156,20 +214,50 @@ void setup() {
   telemetry.downsample = 0; // off by default, use register 28 to set
   uint8_t telemetry_registers[] = { REG_TARGET, REG_ANGLE, REG_VELOCITY, REG_SENSOR_MECHANICAL_ANGLE, REG_ITERATIONS_SEC };
   telemetry.setTelemetryRegisters(sizeof(telemetry_registers)/sizeof(SimpleFOCRegister), telemetry_registers);
-  telemetry.init(textIO);
+  telemetry.init(IO);
 
   Serial.println(F("Motor ready."));
   Serial.println(F("Set the target using serial terminal:"));
+
+  SST::init();
+  commutate_task.setIRQ(COMP4_IRQn);
+  commutate_task.start(
+    2U,
+    commutateQSto,
+    ARRAY_NELEM(commutateQSto),
+    nullptr
+  );
+
+  move_task.setIRQ(COMP1_2_3_IRQn);
+  move_task.start(
+    1U,
+    moveQSto,
+    ARRAY_NELEM(moveQSto),
+    nullptr
+  );
+  
+  SST::start(); // Start SST Scheduler
+  SST::onStart(); // configure and start the interrupts
+  // Do NOT WFI forever, because arduino expects loop to run serial/usb tasks after loop exits
 }
-
-
+uint32_t time_prev=0;
+int i =0;
 void loop() {
+  // uint32_t t_now = micros();
+  // if (t_now-time_prev > int(1e6*15)) {
+  //   time_prev=t_now;
+  //   Serial.printf("\n\n%d\n\n",i);
+  //   i=0;
+  // }
+
   // Motion control function
-  motor.move();
-  // main FOC algorithm function
-  motor.loopFOC();
+  // motor.move();
+  // main FOC algorithm function  
+  // motor.loopFOC();
   // user communication
   command.run();
   // telemetry
   telemetry.run();
+  // delayMicroseconds(15);
+  i+=1;
 }
